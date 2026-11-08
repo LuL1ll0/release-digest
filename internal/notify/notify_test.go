@@ -1208,18 +1208,20 @@ func TestCrosscheckAfterUrgent(t *testing.T) {
 			h.summarize(r, summarize.Summary{Headline: "Parser changes", SecurityUrgency: "none"})
 			h.pass()
 			after := h.alert(r)
-			if state == "queued" || state == "sending" {
-				// No longer urgent: the unsent urgent alert becomes the
+			if state == "queued" {
+				// No longer urgent: the queued urgent alert becomes the
 				// priority-3 cross-check alert instead of sending stale content.
+				// A sending row is left alone (below): rebuilding it mid-POST
+				// would lose the record that the delivery was urgent.
 				if after == nil || after.Reason != "crosscheck" {
-					t.Fatalf("unsent urgent row not rebuilt as crosscheck: %+v", after)
+					t.Fatalf("queued urgent row not rebuilt as crosscheck: %+v", after)
 				}
 				p, err := DecodePayload(after.Payload)
 				if err != nil || p.Priority != 3 {
 					t.Fatalf("rebuilt payload: %+v, %v", p, err)
 				}
 			} else if !reflect.DeepEqual(before, after) {
-				t.Fatalf("crosscheck changed terminal urgent row: before %+v, after %+v", before, after)
+				t.Fatalf("crosscheck changed %s urgent row: before %+v, after %+v", state, before, after)
 			}
 			h.drain()
 			want := 0

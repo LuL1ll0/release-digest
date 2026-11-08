@@ -285,11 +285,13 @@ func (a *Alerter) outbox(ctx context.Context, tx *store.Tx, r *store.Release, su
 	}
 	if n != nil && n.Reason != "crosscheck" && d.Urgency != store.UrgencyUrgent && a.Cfg.Notify.Crosscheck && len(d.Unconfirmed) > 0 {
 		// The release is no longer urgent but its notes still carry security
-		// signals. A sent, cancelled or expired urgent alert is left alone,
-		// so a cross-check never resends a release. An unsent one would
-		// deliver a stale urgent payload, so it falls through and is rebuilt
-		// as the cross-check alert below.
-		if n.State != store.AlertQueued && n.State != store.AlertSending {
+		// signals. A queued urgent alert would deliver a stale urgent
+		// payload, so it falls through and is rebuilt as the cross-check
+		// alert below. Any other urgent alert is left alone: a sending one
+		// is already being posted as urgent, and rebuilding it would lose
+		// the record that its delivery was urgent; a sent, cancelled or
+		// expired one must never be resent by a cross-check.
+		if n.State != store.AlertQueued {
 			return false, nil
 		}
 	}
