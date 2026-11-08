@@ -67,23 +67,39 @@ var sourceText = map[string]string{
 	"compare":      "the commit messages since the previous version (newest first)",
 }
 
-var delimiterTag = regexp.MustCompile(`(?i)<\s*/?\s*(?:notes|instructions)(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*|/\s*)?>`)
+var delimiterTag = regexp.MustCompile(`(?i)<\s*/?\s*(?:notes|instructions)(?:[\s/>]|$)`)
+var delimiterTail = regexp.MustCompile(`^(?:[^<>"']|"[^"]*"|'[^']*')*>`)
 
-// escapeDelimiters preserves other markup while keeping text inside its block.
+// escapeDelimiters escapes delimiter-shaped prefixes, including incomplete tags.
 // max_input_chars bounds raw notes before this encoding, not the whole request.
 // Encoding expands text by at most 4x (normally much less); nothing truncates
 // it afterward, so an escape sequence is never split.
 func escapeDelimiters(text string) string {
-	return delimiterTag.ReplaceAllStringFunc(text, func(tag string) string {
-		tag = strings.ReplaceAll(tag, "<", "&lt;")
-		return strings.ReplaceAll(tag, ">", "&gt;")
-	})
+	var b strings.Builder
+	for {
+		match := delimiterTag.FindStringIndex(text)
+		if match == nil {
+			b.WriteString(text)
+			return b.String()
+		}
+		b.WriteString(text[:match[0]])
+		end := match[1]
+		// Include a complete suffix when possible, without requiring one.
+		if text[end-1] != '>' {
+			if tail := delimiterTail.FindStringIndex(text[end:]); tail != nil {
+				end += tail[1]
+			}
+		}
+		tag := strings.ReplaceAll(text[match[0]:end], "<", "&lt;")
+		b.WriteString(strings.ReplaceAll(tag, ">", "&gt;"))
+		text = text[end:]
+	}
 }
 
 // Messages are the request messages for in. They hold everything about the
 // release that the reply depends on, so they are what the cache key covers.
 func Messages(prompt string, in Input) []llm.Message {
-	prev := in.PrevTag
+	prev := escapeDelimiters(in.PrevTag)
 	if prev == "" {
 		prev = "unknown"
 	}
@@ -92,7 +108,7 @@ func Messages(prompt string, in Input) []llm.Message {
 		src = in.Source
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "Repository: %s\nVersion: %s\nPrevious version: %s\nNotes: %s\n\n", in.Repo, in.Tag, prev, src)
+	fmt.Fprintf(&b, "Repository: %s\nVersion: %s\nPrevious version: %s\nNotes: %s\n\n", escapeDelimiters(in.Repo), escapeDelimiters(in.Tag), prev, src)
 	if in.Instructions != "" {
 		// Outside the notes block: these come from the feed's owner, not
 		// the project. They steer emphasis only; the rules for facts and
