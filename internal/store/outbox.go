@@ -21,7 +21,7 @@ type Notification struct {
 	GUID            string
 	Repo, Tag       string
 	Channel         string // ntfy
-	Reason          string // advisory:GHSA-… | llm
+	Reason          string // advisory:GHSA-… | llm | crosscheck
 	Payload         string
 	State           string
 	CancelRequested bool

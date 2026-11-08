@@ -1,6 +1,7 @@
 package notify
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -870,5 +872,138 @@ func TestResummarizeNeverResends(t *testing.T) {
 	}
 	if n := h.alert(r); n.State != store.AlertSent || h.ntfy.count() != 1 {
 		t.Errorf("after resummaries: %s, %d POSTs", n.State, h.ntfy.count())
+	}
+}
+
+func TestDecideUnconfirmed(t *testing.T) {
+	r := &store.Release{Repo: "o/r", Tag: "v1.2.3", PrevTag: "v1.2.2"}
+	found := &store.Advisory{ID: ghsa, Found: true, FetchedAt: t0, JSON: "[" + advisoryJSON(ghsa, "high", false) + "]"}
+	for _, tc := range []struct {
+		name       string
+		notes      string
+		summary    *summarize.Summary
+		links      []store.Link
+		want       []string
+		urgency    string
+		source     string
+		priority   int
+		downgraded bool
+	}{
+		{"silent LLM", "Fix RCE", &summarize.Summary{SecurityUrgency: "none"}, nil, []string{"remote code execution"}, "none", "", 0, false},
+		{"legacy summary", "Fix XSS", &summarize.Summary{}, nil, []string{"cross-site scripting"}, "none", "", 0, false},
+		{"listed fix", "Fix RCE", &summarize.Summary{SecurityUrgency: "none", Security: []string{"Fix RCE"}}, nil, nil, "none", "", 0, false},
+		{"advisory fires", fixNotes, &summarize.Summary{SecurityUrgency: "none"}, []store.Link{{AdvisoryID: ghsa, Advisory: found}}, nil, "urgent", "advisory:" + ghsa, 4, false},
+		{"advisory not fetched", "Fix RCE", &summarize.Summary{SecurityUrgency: "none"}, []store.Link{{AdvisoryID: ghsa}}, []string{"remote code execution"}, "none", "", 0, false},
+		{"no summary", "Fix RCE", nil, nil, nil, "none", "", 0, false},
+		{"no signals", "Faster startup", &summarize.Summary{SecurityUrgency: "none"}, nil, nil, "none", "", 0, false},
+		{"LLM advisory", "Fix RCE", &summarize.Summary{SecurityUrgency: "advisory"}, nil, nil, "advisory", "llm", 0, false},
+		{"empty list downgraded", "Fix vulnerability", &summarize.Summary{SecurityUrgency: "urgent"}, nil, nil, "advisory", "llm", 0, true},
+		{"no keyword downgraded", "Fix RCE", &summarize.Summary{SecurityUrgency: "urgent", Security: []string{"Fix RCE"}}, nil, nil, "advisory", "llm", 0, true},
+		{"LLM urgent", "Fix vulnerability", &summarize.Summary{SecurityUrgency: "urgent", Security: []string{"Fix RCE"}}, nil, nil, "urgent", "llm", 5, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := Decide(Inputs{Release: r, Notes: tc.notes, Summary: tc.summary, Links: tc.links, MinSeverity: "high"})
+			if !reflect.DeepEqual(d.Unconfirmed, tc.want) || d.Urgency != tc.urgency || d.Source != tc.source || d.Priority != tc.priority || d.Downgraded != tc.downgraded {
+				t.Errorf("decision = %+v, want signals %v, urgency %s, source %q, priority %d, downgraded %v", d, tc.want, tc.urgency, tc.source, tc.priority, tc.downgraded)
+			}
+		})
+	}
+}
+
+func TestCrosscheckOutbox(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprint(enabled), func(t *testing.T) {
+			h := newHarness(t, fmt.Sprintf("  crosscheck: %v", enabled))
+			var logs bytes.Buffer
+			h.a.Log = slog.New(slog.NewJSONHandler(&logs, nil))
+			r := h.add("o/r", "v2.0.0", "v1.9.0", store.StateFallback, "Security: Fix RCE and path traversal", time.Hour)
+			h.summarize(r, summarize.Summary{Headline: "Parser changes", SecurityUrgency: "none"})
+			h.pass()
+			if !strings.Contains(logs.String(), `"signals":["remote code execution","path traversal"]`) || !strings.Contains(logs.String(), `"repo":"o/r"`) || !strings.Contains(logs.String(), `"tag":"v2.0.0"`) {
+				t.Errorf("missing structured mismatch log: %s", logs.String())
+			}
+			if got := h.get(r.Repo, r.Tag); got.Urgency != store.UrgencyNone {
+				t.Errorf("crosscheck changed urgency: %+v", got)
+			}
+			if !enabled {
+				if n := h.alert(r); n != nil {
+					t.Fatalf("crosscheck off queued %+v", n)
+				}
+				h.drain()
+				if h.ntfy.count() != 0 {
+					t.Fatal("crosscheck off sent an alert")
+				}
+				return
+			}
+			n := h.alert(r)
+			if n == nil || n.State != store.AlertQueued || n.Reason != "crosscheck" {
+				t.Fatalf("crosscheck alert: %+v", n)
+			}
+			p, err := DecodePayload(n.Payload)
+			if err != nil || p.Priority != 3 || p.Title != "Unconfirmed security signal: o/r v2.0.0" || !strings.Contains(p.Body, "- remote code execution\n- path traversal") {
+				t.Fatalf("payload: %+v, %v", p, err)
+			}
+			if err := h.a.Recompute(context.Background(), r.Repo, r.Tag); err != nil {
+				t.Fatal(err)
+			}
+			h.drain()
+			if err := h.a.Recompute(context.Background(), r.Repo, r.Tag); err != nil {
+				t.Fatal(err)
+			}
+			h.drain()
+			if n := h.alert(r); n.State != store.AlertSent || h.ntfy.count() != 1 {
+				t.Fatalf("dedupe: %+v, POSTs %d", n, h.ntfy.count())
+			}
+			req, _ := h.ntfy.request(0)
+			if req.Header.Get("Priority") != "3" {
+				t.Errorf("sent priority = %s", req.Header.Get("Priority"))
+			}
+			// The shared GUID also prevents a later urgent decision from sending twice.
+			ctx := context.Background()
+			if _, err := h.st.RequestResummarize(ctx, r.Repo, time.Time{}, h.now); err != nil {
+				t.Fatal(err)
+			}
+			urgent := summarize.Summary{Headline: "Security fix", SecurityUrgency: "urgent", Security: []string{"Fix RCE"}}
+			if err := h.st.PutSummary(ctx, &store.Summary{Key: "urgent", Model: "m", JSON: urgent.Encode(), Created: h.now}); err != nil {
+				t.Fatal(err)
+			}
+			if ok, err := h.st.Summarized(ctx, r.Repo, r.Tag, r.NotesHash, "urgent", h.now, h.tick, h.now); err != nil || !ok {
+				t.Fatalf("later summary: %v, %v", ok, err)
+			}
+			h.pass()
+			h.drain()
+			if h.get(r.Repo, r.Tag).Urgency != store.UrgencyUrgent {
+				t.Fatal("later summary did not make the release urgent")
+			}
+			if h.ntfy.count() != 1 {
+				t.Fatal("later urgent decision resent the release")
+			}
+		})
+	}
+}
+
+func TestCrosscheckConfigChangeCancelsQueuedAlert(t *testing.T) {
+	h := newHarness(t, "  crosscheck: true")
+	ctx := context.Background()
+	if err := h.a.CheckConfig(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r := h.add("o/r", "v2.0.0", "v1.9.0", store.StateFallback, "Fix XSS", time.Hour)
+	h.summarize(r, summarize.Summary{Headline: "Parser changes", SecurityUrgency: "none"})
+	h.pass()
+	if n := h.alert(r); n == nil || n.State != store.AlertQueued {
+		t.Fatalf("enabled crosscheck: %+v", n)
+	}
+	h.cfg.Notify.Crosscheck = false
+	if err := h.a.CheckConfig(ctx); err != nil {
+		t.Fatal(err)
+	}
+	h.drain()
+	if h.ntfy.count() != 0 {
+		t.Fatal("stale crosscheck sent before recompute")
+	}
+	h.pass()
+	if n := h.alert(r); n.State != store.AlertCancelled {
+		t.Fatalf("disabled crosscheck: %+v", n)
 	}
 }
