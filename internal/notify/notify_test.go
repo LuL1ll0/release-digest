@@ -3,6 +3,9 @@ package notify
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -706,6 +709,69 @@ func TestConfigChangeHoldsAndCancelsAStaleAlert(t *testing.T) {
 	}
 }
 
+func TestFingerprintCrosscheckOffMatchesLegacy(t *testing.T) {
+	h := newHarness(t, "  crosscheck: false")
+	c := h.cfg
+	// This is the fingerprint document before crosscheck was introduced.
+	type repo struct {
+		Packages   []config.Package `json:"packages"`
+		Prerelease string           `json:"prerelease_pattern"`
+	}
+	legacy := struct {
+		MinSeverity        string          `json:"min_severity"`
+		MaxAge             time.Duration   `json:"max_age"`
+		IncludeBackfill    bool            `json:"include_backfill"`
+		IncludePrereleases bool            `json:"include_prereleases"`
+		Enabled            bool            `json:"enabled"`
+		Repos              map[string]repo `json:"repos"`
+		Defaults           repo            `json:"defaults"`
+	}{c.Notify.MinSeverity, c.Notify.MaxAge.D, c.Notify.IncludeBackfill, c.Notify.IncludePrereleases, true,
+		map[string]repo{}, repo{c.Defaults.Packages, pattern(c.Defaults.PrereleasePattern)}}
+	for _, r := range c.Repos {
+		legacy.Repos[r.Name()] = repo{r.Packages, pattern(r.PrereleasePattern)}
+	}
+	b, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(b)
+	want := hex.EncodeToString(sum[:])
+	if got := Fingerprint(c, true); got != want {
+		t.Fatalf("crosscheck off fingerprint = %s, legacy = %s", got, want)
+	}
+	c.Notify.Crosscheck = true
+	if Fingerprint(c, true) == want {
+		t.Fatal("enabling crosscheck did not change the fingerprint")
+	}
+}
+
+func TestIneligibleAlertLogMessages(t *testing.T) {
+	for _, urgent := range []bool{false, true} {
+		t.Run(fmt.Sprint(urgent), func(t *testing.T) {
+			h := newHarness(t, "  crosscheck: true")
+			var logs bytes.Buffer
+			h.a.Log = slog.New(slog.NewJSONHandler(&logs, nil))
+			r := h.addWith("o/r", "v2.0.0-rc.1", "v1.9.0", store.StateFallback, "Security: Fix RCE", time.Hour,
+				func(r *store.Release) { r.Prerelease = true })
+			s := summarize.Summary{Headline: "Parser changes", SecurityUrgency: "none"}
+			want := "crosscheck not alerted"
+			if urgent {
+				s.SecurityUrgency = "urgent"
+				s.Security = []string{"Fix RCE"}
+				want = "urgent release not alerted"
+			}
+			h.summarize(r, s)
+			h.pass()
+			if !strings.Contains(logs.String(), `"msg":"`+want+`"`) {
+				t.Errorf("missing %q log: %s", want, logs.String())
+			}
+			if n := h.alert(r); n != nil {
+				t.Fatalf("ineligible release queued: %+v", n)
+			}
+		})
+	}
+}
+
 func TestPayloadBudget(t *testing.T) {
 	r := &store.Release{Repo: "o/r", Tag: "v1.2.3", HTMLURL: "https://github.com/o/r/releases/tag/v1.2.3"}
 	long := strings.Repeat("ünïcödé ", 120) // ~1,900 bytes each
@@ -1180,5 +1246,44 @@ func TestCrosscheckConfigChangeCancelsQueuedAlert(t *testing.T) {
 	h.pass()
 	if n := h.alert(r); n.State != store.AlertCancelled {
 		t.Fatalf("disabled crosscheck: %+v", n)
+	}
+}
+
+func TestCrosscheckConfigAndResummaryCancelIneligibleUrgent(t *testing.T) {
+	h := newHarness(t, "  crosscheck: true\n  include_prereleases: true")
+	ctx := context.Background()
+	if err := h.a.CheckConfig(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r := h.addWith("o/r", "v2.0.0-rc.1", "v1.9.0", store.StateFallback, "Security: Fix RCE", time.Hour,
+		func(r *store.Release) { r.Prerelease = true })
+	h.summarize(r, summarize.Summary{Headline: "Security fix", SecurityUrgency: "urgent", Security: []string{"Fix RCE"}})
+	h.pass()
+	if n := h.alert(r); n == nil || n.State != store.AlertQueued || n.Reason != "llm" {
+		t.Fatalf("initial urgent alert: %+v", n)
+	}
+	// Restart with prerelease alerts disabled, then resummarize the same notes.
+	h.cfg.Notify.IncludePrereleases = false
+	if err := h.a.CheckConfig(ctx); err != nil {
+		t.Fatal(err)
+	}
+	h.drain()
+	if h.ntfy.count() != 0 {
+		t.Fatal("stale urgent alert sent before recompute")
+	}
+	if _, err := h.st.RequestResummarize(ctx, r.Repo, time.Time{}, h.now); err != nil {
+		t.Fatal(err)
+	}
+	h.summarize(r, summarize.Summary{Headline: "Parser changes", SecurityUrgency: "none"})
+	h.pass()
+	if got := h.get(r.Repo, r.Tag); got.Urgency != store.UrgencyNone {
+		t.Fatalf("resummarized urgency: %s", got.Urgency)
+	}
+	if n := h.alert(r); n == nil || n.State != store.AlertCancelled {
+		t.Fatalf("ineligible urgent alert: %+v", n)
+	}
+	h.drain()
+	if h.ntfy.count() != 0 {
+		t.Fatal("ineligible urgent alert was sent")
 	}
 }

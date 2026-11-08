@@ -259,9 +259,6 @@ func (a *Alerter) outbox(ctx context.Context, tx *store.Tx, r *store.Release, su
 	if err != nil {
 		return false, err
 	}
-	if n != nil && n.Reason != "crosscheck" && d.Urgency != store.UrgencyUrgent && a.Cfg.Notify.Crosscheck && len(d.Unconfirmed) > 0 {
-		return false, nil
-	}
 	eligible, why, err := a.eligible(ctx, tx, r, now)
 	if err != nil {
 		return false, err
@@ -278,14 +275,21 @@ func (a *Alerter) outbox(ctx context.Context, tx *store.Tx, r *store.Release, su
 			return false, tx.Cancel(ctx, r.GUID)
 		}
 		if alert && n == nil {
-			a.Log.Info("release not alerted", "repo", r.Repo, "tag", r.Tag, "why", why)
+			message := "crosscheck not alerted"
+			if d.Urgency == store.UrgencyUrgent {
+				message = "urgent release not alerted"
+			}
+			a.Log.Info(message, "repo", r.Repo, "tag", r.Tag, "why", why)
 		}
+		return false, nil
+	}
+	if n != nil && n.Reason != "crosscheck" && d.Urgency != store.UrgencyUrgent && a.Cfg.Notify.Crosscheck && len(d.Unconfirmed) > 0 {
 		return false, nil
 	}
 	payload := BuildPayload(r, sum, d)
 	reason := d.Source
 	if d.Urgency != store.UrgencyUrgent {
-		payload = unconfirmedPayload(r, d.Unconfirmed)
+		payload = UnconfirmedPayload(r, d.Unconfirmed)
 		reason = "crosscheck"
 	}
 	p := payload.Encode()
@@ -365,7 +369,7 @@ func Fingerprint(c *config.Config, enabled bool) string {
 		MaxAge             time.Duration   `json:"max_age"`
 		IncludeBackfill    bool            `json:"include_backfill"`
 		IncludePrereleases bool            `json:"include_prereleases"`
-		Crosscheck         bool            `json:"crosscheck"`
+		Crosscheck         bool            `json:"crosscheck,omitempty"`
 		Enabled            bool            `json:"enabled"`
 		Repos              map[string]repo `json:"repos"`
 		Defaults           repo            `json:"defaults"`
