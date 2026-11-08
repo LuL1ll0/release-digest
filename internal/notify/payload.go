@@ -89,11 +89,12 @@ func BuildPayload(r *store.Release, sum *summarize.Summary, d Decision) Payload 
 			left -= len("\n\n")
 		}
 		contentBudget := left - len(prefix) - len(suffix)
-		if contentBudget < len("…") {
+		severity := escapeMarkdown(l.Severity)
+		if len(severity) > contentBudget && contentBudget < len("…") {
 			p.Body = assemble(parts, BodyBudget)
 			return p
 		}
-		parts = append(parts, prefix+truncate(escapeMarkdown(l.Severity), contentBudget)+suffix)
+		parts = append(parts, prefix+truncate(severity, contentBudget)+suffix)
 	}
 	if sum != nil {
 		if reason := sum.SecurityReason; reason != "" {

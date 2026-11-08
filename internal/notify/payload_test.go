@@ -136,7 +136,7 @@ func TestPayloadSeverityBudgets(t *testing.T) {
 			}
 			parts := strings.Split(p.Body, "\n\n")
 			if tc.omit {
-				if len(parts) != 1 {
+				if p.Body != "**"+tc.headline+"**" {
 					t.Errorf("body = %q, want only headline when severity wrappers cannot fit", p.Body)
 				}
 				return
@@ -146,6 +146,21 @@ func TestPayloadSeverityBudgets(t *testing.T) {
 				t.Errorf("body = %q, want closed bold severity with truncated content", p.Body)
 			}
 		})
+	}
+}
+
+// A short severity that fits exactly is kept, even when there would be no
+// room left to truncate it.
+func TestPayloadSeverityFitsExactly(t *testing.T) {
+	headline := strings.Repeat("h", 3453)
+	d := Decision{Links: []LinkResult{{ID: ghsa, Fires: true, Severity: "hi"}}}
+	p := BuildPayload(&store.Release{}, &summarize.Summary{Headline: headline}, d)
+	want := "**" + headline + "**\n\nSeverity: **hi** (" + escapeMarkdown(ghsa) + ")"
+	if p.Body != want {
+		t.Errorf("body is %d bytes, ends %q; want %d bytes", len(p.Body), p.Body[len(p.Body)-20:], len(want))
+	}
+	if len(p.Body) != BodyBudget {
+		t.Errorf("body is %d bytes, want exactly %d", len(p.Body), BodyBudget)
 	}
 }
 
