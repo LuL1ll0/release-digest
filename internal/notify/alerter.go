@@ -250,13 +250,17 @@ func (a *Alerter) inputs(ctx context.Context, tx *store.Tx, r *store.Release) (I
 }
 
 // outbox applies a decision to the release's alert. An urgent or opted-in unconfirmed release
-// that may alert is enqueued once, or has its unsent alert rebuilt; any
-// other release has its unsent alert cancelled. It reports whether an
-// alert is now queued.
+// that may alert is enqueued or rebuilt, including sent cross-checks becoming
+// urgent. Cross-checks leave existing urgent alerts alone; otherwise a release
+// that no longer qualifies has its unsent alert cancelled. It reports whether
+// an alert is now queued or sending.
 func (a *Alerter) outbox(ctx context.Context, tx *store.Tx, r *store.Release, sum *summarize.Summary, d Decision, now time.Time) (bool, error) {
 	n, err := tx.Notification(ctx, r.GUID)
 	if err != nil {
 		return false, err
+	}
+	if n != nil && n.Reason != "crosscheck" && d.Urgency != store.UrgencyUrgent && a.Cfg.Notify.Crosscheck && len(d.Unconfirmed) > 0 {
+		return false, nil
 	}
 	eligible, why, err := a.eligible(ctx, tx, r, now)
 	if err != nil {
@@ -294,7 +298,12 @@ func (a *Alerter) outbox(ctx context.Context, tx *store.Tx, r *store.Release, su
 	if n.Payload == p && n.Reason == reason && n.Expires.Equal(expires) && n.State != store.AlertCancelled && !n.CancelRequested {
 		return false, nil
 	}
-	ok, err := tx.Rebuild(ctx, r.GUID, reason, p, expires, now)
+	var ok bool
+	if n.Reason == "crosscheck" && d.Urgency == store.UrgencyUrgent {
+		ok, err = tx.EscalateCrosscheck(ctx, r.GUID, reason, p, expires, now)
+	} else {
+		ok, err = tx.Rebuild(ctx, r.GUID, reason, p, expires, now)
+	}
 	if ok {
 		a.Log.Info("alert rebuilt", "repo", r.Repo, "tag", r.Tag, "reason", reason, "was", n.State)
 	}

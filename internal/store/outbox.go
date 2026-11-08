@@ -73,6 +73,22 @@ func (s ops) Enqueue(ctx context.Context, n *Notification) (bool, error) {
 	return c > 0, err
 }
 
+// EscalateCrosscheck replaces an unconfirmed alert in any state with an urgent
+// alert, due now with fresh delivery bookkeeping. An active claim stays sending;
+// Finish must distinguish the payload it posted from this replacement.
+func (s ops) EscalateCrosscheck(ctx context.Context, guid, reason, payload string, expires, now time.Time) (bool, error) {
+	res, err := s.q.ExecContext(ctx, `UPDATE notifications SET reason = ?, payload = ?, expires_at = ?,
+		state = CASE WHEN state = ? THEN state ELSE ? END, cancel_requested = 0,
+		attempts = 0, next_attempt_at = ?, sent_at = NULL, acked_at = NULL, last_error = ''
+		WHERE guid = ? AND reason = 'crosscheck' AND (? = 'llm' OR ? LIKE 'advisory:%')`,
+		reason, payload, toMS(expires), AlertSending, AlertQueued, toMS(now), guid, reason, reason)
+	if err != nil {
+		return false, err
+	}
+	c, err := res.RowsAffected()
+	return c > 0, err
+}
+
 // Rebuild replaces an unsent alert's reason, payload and window after the
 // release escalated again (docs/security-alerts.md): a cancelled row returns to queued, due at
 // once; a sending row has its cancel request cleared, so a failed POST
@@ -201,16 +217,28 @@ const releaseSendable = `COALESCE(rs.held, 0) = 0 AND r.urgency_dirty = 0 AND r.
 
 // Finish ends a claim in exactly one state (docs/security-alerts.md): sent on a 2xx; else
 // cancelled if a cancel was requested; else queued again for next, with
-// the attempt counted. It returns the final state ("" if the row wasn't
+// the attempt counted. postedReason identifies the payload actually posted;
+// finishing a cross-check replaced by an urgent alert queues that urgent alert
+// immediately instead. It returns the final state ("" if the row wasn't
 // sending) and whether a cancel had been requested.
-func (s ops) Finish(ctx context.Context, guid string, sent bool, next time.Time, errText string, now time.Time) (string, bool, error) {
+func (s ops) Finish(ctx context.Context, guid, postedReason string, sent bool, next time.Time, errText string, now time.Time) (string, bool, error) {
 	n, err := s.Notification(ctx, guid)
 	if err != nil || n == nil || n.State != AlertSending {
 		return "", false, err
 	}
 	var q string
 	var args []any
+	replaced := postedReason == "crosscheck" && n.Reason != "crosscheck"
+	state := map[bool]string{true: AlertSent, false: AlertQueued}[sent]
 	switch {
+	case replaced:
+		// The cross-check POST cannot satisfy an urgent alert that replaced it.
+		state = AlertQueued
+		if n.CancelRequested {
+			state = AlertCancelled
+		}
+		q, args = `UPDATE notifications SET state = ?, next_attempt_at = ?, cancel_requested = 0 WHERE guid = ? AND state = ?`,
+			[]any{state, toMS(now), guid, AlertSending}
 	case sent:
 		q, args = `UPDATE notifications SET state = ?, sent_at = ?, cancel_requested = 0, last_error = '' WHERE guid = ? AND state = ?`,
 			[]any{AlertSent, toMS(now), guid, AlertSending}
@@ -224,8 +252,7 @@ func (s ops) Finish(ctx context.Context, guid string, sent bool, next time.Time,
 	if _, err := s.q.ExecContext(ctx, q, args...); err != nil {
 		return "", false, err
 	}
-	state := map[bool]string{true: AlertSent, false: AlertQueued}[sent]
-	if !sent && n.CancelRequested {
+	if !replaced && !sent && n.CancelRequested {
 		state = AlertCancelled
 	}
 	return state, n.CancelRequested, nil

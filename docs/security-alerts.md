@@ -124,9 +124,10 @@ startup, including cancellation of queued cross-check alerts when disabled.
 
 Unconfirmed and urgent alerts share the existing outbox row keyed by release
 GUID. Repeated recomputation queues no duplicate, and an unsent payload can be
-rebuilt when the signals change. A release already sent as unconfirmed will
-not send again if it later becomes urgent, and vice versa: the once-per-release
-rule applies across both kinds of alert.
+rebuilt when the signals change. If an unconfirmed release becomes urgent,
+the row is rebuilt into an urgent alert even if the unconfirmed alert was
+already sent. Once an urgent alert exists, a cross-check never replaces or
+re-sends it. Further urgent decisions follow normal deduplication.
 
 ## Urgency on the item
 
@@ -162,7 +163,9 @@ scheduler tick.
 - **Timing.** The worker wakes every 30s, or immediately when a row is
   enqueued, and sends at most 10 per wake, each with a 10s timeout.
 - **Once per release.** Rows are keyed by GUID, so `resummarize`, restarts
-  and state transitions never enqueue twice.
+  and state transitions deduplicate alerts. Escalation from an unconfirmed
+  cross-check to urgent reuses the row and permits one urgent delivery,
+  even after the unconfirmed alert was sent.
 - **Claiming.** The worker moves a row from `queued` to `sending` in its own
   transaction. It skips rows whose release is dirty, has notes not yet scanned
   for advisory IDs, or is confirmed deleted, and rows whose repo is held. It
@@ -181,14 +184,18 @@ scheduler tick.
   | POST fails or is ambiguous | → `queued` with backoff | → `cancelled`, no retry; an ambiguous POST may have been delivered, and that's logged |
 
 - **De-escalation cancels unsent alerts** unless an enabled unconfirmed
-  cross-check still qualifies the release. A `queued` row becomes
+  cross-check still qualifies the release; that cross-check leaves an existing
+  urgent alert unchanged. A `queued` row becomes
   `cancelled`; a `sending` row gets `cancel_requested`, and the table above
   decides.
 - **Re-escalation** within `max_age` rebuilds the row's reason, payload and
   priority from the current signals. A `cancelled` row returns to `queued`; a
   `sending` row has its cancel request cleared. A re-queued alert never
-  carries a withdrawn advisory's text. A `sent` row is never touched: no
-  retraction and no second send.
+  carries a withdrawn advisory's text. A `sent` urgent row is never touched.
+  An unconfirmed cross-check in any state can become urgent, with fresh retry
+  bookkeeping. If its POST is already in flight, completing that cross-check
+  leaves the urgent alert queued; if escalation precedes the POST, only the
+  urgent payload is delivered.
 - **Crash safety.** A row left in `sending` goes back to `queued` at startup,
   or to `cancelled` if a cancel was requested.
 

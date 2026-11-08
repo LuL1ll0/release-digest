@@ -958,7 +958,7 @@ func TestCrosscheckOutbox(t *testing.T) {
 			if req.Header.Get("Priority") != "3" {
 				t.Errorf("sent priority = %s", req.Header.Get("Priority"))
 			}
-			// The shared GUID also prevents a later urgent decision from sending twice.
+			// A sent cross-check must not suppress a later urgent decision.
 			ctx := context.Background()
 			if _, err := h.st.RequestResummarize(ctx, r.Repo, time.Time{}, h.now); err != nil {
 				t.Fatal(err)
@@ -975,8 +975,183 @@ func TestCrosscheckOutbox(t *testing.T) {
 			if h.get(r.Repo, r.Tag).Urgency != store.UrgencyUrgent {
 				t.Fatal("later summary did not make the release urgent")
 			}
-			if h.ntfy.count() != 1 {
-				t.Fatal("later urgent decision resent the release")
+			if h.ntfy.count() != 2 {
+				t.Fatalf("later urgent decision: %d POSTs, want 2", h.ntfy.count())
+			}
+			req, body := h.ntfy.request(1)
+			title, err := new(mime.WordDecoder).DecodeHeader(req.Header.Get("Title"))
+			if err != nil || title != "🚨 o/r v2.0.0: security release" || req.Header.Get("Priority") != "5" || body != BuildPayload(r, &urgent, Decision{Priority: 5}).Body {
+				t.Fatalf("urgent POST: title %q, priority %q, body %q, error %v", title, req.Header.Get("Priority"), body, err)
+			}
+			h.nextTick(time.Minute)
+			if err := h.a.Recompute(ctx, r.Repo, r.Tag); err != nil {
+				t.Fatal(err)
+			}
+			h.pass()
+			h.drain()
+			if h.ntfy.count() != 2 {
+				t.Fatal("urgent alert sent again")
+			}
+		})
+	}
+}
+
+func TestCrosscheckEscalatesToAdvisory(t *testing.T) {
+	for _, sent := range []bool{false, true} {
+		t.Run(fmt.Sprint(sent), func(t *testing.T) {
+			h := newHarness(t, "  crosscheck: true")
+			h.setAdvisory(ghsa, advisoryJSON(ghsa, "low", false))
+			r := h.add("o/r", "v1.2.3", "v1.2.2", store.StateFallback, fixNotes, time.Hour)
+			h.summarize(r, summarize.Summary{Headline: "Parser changes", SecurityUrgency: "none"})
+			h.pass()
+			if n := h.alert(r); n == nil || n.Reason != "crosscheck" {
+				t.Fatalf("initial crosscheck: %+v", n)
+			}
+			want := 1
+			if sent {
+				h.drain()
+				want++
+			}
+			h.setAdvisory(ghsa, advisoryJSON(ghsa, "high", false))
+			h.nextTick(25 * time.Hour)
+			h.pass()
+			n := h.alert(r)
+			if n == nil || n.State != store.AlertQueued || n.Reason != "advisory:"+ghsa {
+				t.Fatalf("urgent advisory: %+v", n)
+			}
+			p, err := DecodePayload(n.Payload)
+			if err != nil || p.Priority != 4 || p.Title != "🚨 o/r v1.2.3: security release" || !strings.Contains(p.Body, "Severity: **high** ("+ghsa+")") {
+				t.Fatalf("urgent advisory payload: %+v, %v", p, err)
+			}
+			h.drain()
+			if h.ntfy.count() != want {
+				t.Fatalf("POSTs %d, want %d", h.ntfy.count(), want)
+			}
+			req, body := h.ntfy.request(want - 1)
+			if req.Header.Get("Priority") != "4" || body != p.Body {
+				t.Fatalf("urgent advisory POST: priority %q, body %q", req.Header.Get("Priority"), body)
+			}
+			h.nextTick(time.Minute)
+			h.pass()
+			h.drain()
+			if h.ntfy.count() != want || h.alert(r).State != store.AlertSent {
+				t.Fatal("urgent advisory was not deduplicated")
+			}
+		})
+	}
+}
+
+func TestCrosscheckEscalationBeforeDelivery(t *testing.T) {
+	for _, stage := range []string{"queued", "during check", "during POST"} {
+		t.Run(stage, func(t *testing.T) {
+			h := newHarness(t, "  crosscheck: true")
+			ctx := context.Background()
+			r := h.add("o/r", "v2.0.0", "v1.9.0", store.StateFallback, "Security: Fix RCE", time.Hour)
+			h.summarize(r, summarize.Summary{Headline: "Parser changes", SecurityUrgency: "none"})
+			h.pass()
+			urgent := summarize.Summary{Headline: "Security fix", SecurityUrgency: "urgent", Security: []string{"Fix RCE"}}
+			escalate := func() {
+				if _, err := h.st.RequestResummarize(ctx, r.Repo, time.Time{}, h.now); err != nil {
+					t.Error(err)
+					return
+				}
+				if err := h.st.PutSummary(ctx, &store.Summary{Key: "urgent", Model: "m", JSON: urgent.Encode(), Created: h.now}); err != nil {
+					t.Error(err)
+					return
+				}
+				if ok, err := h.st.Summarized(ctx, r.Repo, r.Tag, r.NotesHash, "urgent", h.now, h.tick, h.now); err != nil || !ok {
+					t.Errorf("urgent summary: %v, %v", ok, err)
+					return
+				}
+				if err := h.a.Recompute(ctx, r.Repo, r.Tag); err != nil {
+					t.Error(err)
+				}
+			}
+			want := 1
+			switch stage {
+			case "queued":
+				escalate()
+			case "during check":
+				check := h.o.Check
+				h.o.Check = func(ctx context.Context, repo string) (github.Visibility, error) {
+					escalate()
+					return check(ctx, repo)
+				}
+			case "during POST":
+				want = 2
+				h.ntfy.set(func(f *fakeNtfy) {
+					f.during = func() {
+						h.ntfy.set(func(f *fakeNtfy) { f.during = nil })
+						escalate()
+					}
+				})
+			}
+			h.drain()
+			if n := h.alert(r); n == nil || n.State != store.AlertSent || n.Reason != "llm" || h.ntfy.count() != want {
+				t.Fatalf("escalation: %+v, POSTs %d, want %d", n, h.ntfy.count(), want)
+			}
+			req, body := h.ntfy.request(want - 1)
+			title, err := new(mime.WordDecoder).DecodeHeader(req.Header.Get("Title"))
+			if err != nil || title != "🚨 o/r v2.0.0: security release" || req.Header.Get("Priority") != "5" || body != BuildPayload(r, &urgent, Decision{Priority: 5}).Body {
+				t.Fatalf("urgent POST: title %q, priority %q, body %q, error %v", title, req.Header.Get("Priority"), body, err)
+			}
+			h.nextTick(time.Minute)
+			if err := h.a.Recompute(ctx, r.Repo, r.Tag); err != nil {
+				t.Fatal(err)
+			}
+			h.pass()
+			h.drain()
+			if h.ntfy.count() != want {
+				t.Fatal("urgent alert sent again")
+			}
+		})
+	}
+}
+
+func TestCrosscheckNeverReplacesUrgent(t *testing.T) {
+	for _, state := range []string{"queued", "sending", "sent", "cancelled", "expired"} {
+		t.Run(state, func(t *testing.T) {
+			h := newHarness(t, "  crosscheck: true")
+			ctx := context.Background()
+			r := h.add("o/r", "v2.0.0", "v1.9.0", store.StateFallback, "Security: Fix RCE", time.Hour)
+			h.summarize(r, summarize.Summary{Headline: "Security fix", SecurityUrgency: "urgent", Security: []string{"Fix RCE"}})
+			h.pass()
+			switch state {
+			case "sending":
+				if n, err := h.st.Claim(ctx, h.now); err != nil || n == nil {
+					t.Fatalf("claim: %+v, %v", n, err)
+				}
+			case "sent":
+				h.drain()
+			case "cancelled":
+				if err := h.st.Cancel(ctx, r.GUID); err != nil {
+					t.Fatal(err)
+				}
+			case "expired":
+				if _, err := h.st.Expire(ctx, h.now.Add(8*24*time.Hour)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := h.alert(r)
+			if before == nil || before.State != state {
+				t.Fatalf("initial alert: %+v", before)
+			}
+			if _, err := h.st.RequestResummarize(ctx, r.Repo, time.Time{}, h.now); err != nil {
+				t.Fatal(err)
+			}
+			h.summarize(r, summarize.Summary{Headline: "Parser changes", SecurityUrgency: "none"})
+			h.pass()
+			after := h.alert(r)
+			if !reflect.DeepEqual(before, after) {
+				t.Fatalf("crosscheck changed urgent row: before %+v, after %+v", before, after)
+			}
+			h.drain()
+			want := 0
+			if state == "sent" || state == "queued" {
+				want = 1
+			}
+			if h.ntfy.count() != want {
+				t.Fatalf("POSTs %d, want %d", h.ntfy.count(), want)
 			}
 		})
 	}
