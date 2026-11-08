@@ -126,8 +126,12 @@ Unconfirmed and urgent alerts share the existing outbox row keyed by release
 GUID. Repeated recomputation queues no duplicate, and an unsent payload can be
 rebuilt when the signals change. If an unconfirmed release becomes urgent,
 the row is rebuilt into an urgent alert even if the unconfirmed alert was
-already sent. Once an urgent alert exists, a cross-check never replaces or
-re-sends it. Further urgent decisions follow normal deduplication.
+already sent. If an urgent release is later de-escalated while its notes
+still carry signals, an unsent urgent alert is rebuilt as the priority-3
+cross-check alert, so it neither delivers the stale urgent payload nor goes
+silent. A sent, cancelled or expired urgent alert is left alone; a
+cross-check never re-sends a release. Further urgent decisions follow normal
+deduplication.
 
 ## Urgency on the item
 
@@ -184,8 +188,9 @@ scheduler tick.
   | POST fails or is ambiguous | → `queued` with backoff | → `cancelled`, no retry; an ambiguous POST may have been delivered, and that's logged |
 
 - **De-escalation cancels unsent alerts** unless an enabled unconfirmed
-  cross-check still qualifies the release; that cross-check leaves an existing
-  urgent alert unchanged. A `queued` row becomes
+  cross-check still qualifies the release; then an unsent urgent alert is
+  rebuilt as the cross-check alert, and a terminal one is left unchanged. A
+  `queued` row becomes
   `cancelled`; a `sending` row gets `cancel_requested`, and the table above
   decides.
 - **Re-escalation** within `max_age` rebuilds the row's reason, payload and

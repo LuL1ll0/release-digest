@@ -1174,7 +1174,7 @@ func TestCrosscheckEscalationBeforeDelivery(t *testing.T) {
 	}
 }
 
-func TestCrosscheckNeverReplacesUrgent(t *testing.T) {
+func TestCrosscheckAfterUrgent(t *testing.T) {
 	for _, state := range []string{"queued", "sending", "sent", "cancelled", "expired"} {
 		t.Run(state, func(t *testing.T) {
 			h := newHarness(t, "  crosscheck: true")
@@ -1208,8 +1208,18 @@ func TestCrosscheckNeverReplacesUrgent(t *testing.T) {
 			h.summarize(r, summarize.Summary{Headline: "Parser changes", SecurityUrgency: "none"})
 			h.pass()
 			after := h.alert(r)
-			if !reflect.DeepEqual(before, after) {
-				t.Fatalf("crosscheck changed urgent row: before %+v, after %+v", before, after)
+			if state == "queued" || state == "sending" {
+				// No longer urgent: the unsent urgent alert becomes the
+				// priority-3 cross-check alert instead of sending stale content.
+				if after == nil || after.Reason != "crosscheck" {
+					t.Fatalf("unsent urgent row not rebuilt as crosscheck: %+v", after)
+				}
+				p, err := DecodePayload(after.Payload)
+				if err != nil || p.Priority != 3 {
+					t.Fatalf("rebuilt payload: %+v, %v", p, err)
+				}
+			} else if !reflect.DeepEqual(before, after) {
+				t.Fatalf("crosscheck changed terminal urgent row: before %+v, after %+v", before, after)
 			}
 			h.drain()
 			want := 0
@@ -1218,6 +1228,11 @@ func TestCrosscheckNeverReplacesUrgent(t *testing.T) {
 			}
 			if h.ntfy.count() != want {
 				t.Fatalf("POSTs %d, want %d", h.ntfy.count(), want)
+			}
+			if state == "queued" {
+				if req, _ := h.ntfy.request(0); req.Header.Get("Priority") != "3" {
+					t.Fatalf("queued de-escalation sent priority %s, want 3", req.Header.Get("Priority"))
+				}
 			}
 		})
 	}
@@ -1285,5 +1300,43 @@ func TestCrosscheckConfigAndResummaryCancelIneligibleUrgent(t *testing.T) {
 	h.drain()
 	if h.ntfy.count() != 0 {
 		t.Fatal("ineligible urgent alert was sent")
+	}
+}
+
+// An eligible release that is no longer urgent, but whose notes still carry
+// cross-check signals, has its unsent urgent alert rebuilt as one priority-3
+// cross-check alert: not the stale urgent payload, and not nothing.
+func TestCrosscheckDeescalationRebuildsUnsentUrgent(t *testing.T) {
+	h := newHarness(t, "  crosscheck: true")
+	ctx := context.Background()
+	r := h.add("o/r", "v2.0.0", "v1.9.0", store.StateFallback, "Security: Fix RCE", time.Hour)
+	h.summarize(r, summarize.Summary{Headline: "Security fix", SecurityUrgency: "urgent", Security: []string{"Fix RCE"}})
+	h.pass()
+	if n := h.alert(r); n == nil || n.State != store.AlertQueued || n.Reason != "llm" {
+		t.Fatalf("initial urgent alert: %+v", n)
+	}
+	if _, err := h.st.RequestResummarize(ctx, r.Repo, time.Time{}, h.now); err != nil {
+		t.Fatal(err)
+	}
+	h.summarize(r, summarize.Summary{Headline: "Parser changes", SecurityUrgency: "none"})
+	h.pass()
+	if got := h.get(r.Repo, r.Tag); got.Urgency != store.UrgencyNone {
+		t.Fatalf("resummarized urgency: %s", got.Urgency)
+	}
+	if n := h.alert(r); n == nil || n.State != store.AlertQueued || n.Reason != "crosscheck" {
+		t.Fatalf("de-escalated urgent alert: %+v", n)
+	}
+	h.drain()
+	if h.ntfy.count() != 1 {
+		t.Fatalf("de-escalated release: %d POSTs, want 1", h.ntfy.count())
+	}
+	if req, _ := h.ntfy.request(0); req.Header.Get("Priority") != "3" {
+		t.Fatalf("de-escalated release sent priority %s, want 3", req.Header.Get("Priority"))
+	}
+	h.nextTick(time.Minute)
+	h.pass()
+	h.drain()
+	if h.ntfy.count() != 1 {
+		t.Fatal("cross-check alert sent again")
 	}
 }
