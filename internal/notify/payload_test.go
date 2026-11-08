@@ -84,6 +84,71 @@ func TestPayloadEscapedBudgets(t *testing.T) {
 	}
 }
 
+func TestPayloadHeadlineBudgets(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   string
+		llm  bool
+	}{
+		{"LLM punctuation", strings.Repeat("!", 1749), true},
+		{"advisory punctuation", strings.Repeat("!", 1749), false},
+		{"LLM UTF-8", strings.Repeat("é!", 1000), true},
+		{"advisory UTF-8", strings.Repeat("é!", 1000), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var sum *summarize.Summary
+			d := Decision{}
+			if tc.llm {
+				sum = &summarize.Summary{Headline: tc.in}
+			} else {
+				d.Links = []LinkResult{{
+					ID: ghsa, Fires: true, Severity: "high",
+					Matching: []advisory.Advisory{{GHSA: ghsa, Summary: tc.in}},
+				}}
+			}
+			p := BuildPayload(&store.Release{}, sum, d)
+			headline := strings.SplitN(p.Body, "\n\n", 2)[0]
+			if len(p.Body) > BodyBudget || !utf8.ValidString(p.Body) {
+				t.Errorf("body bytes %d, valid UTF-8 %v", len(p.Body), utf8.ValidString(p.Body))
+			}
+			if !strings.HasPrefix(p.Body, "**") || !strings.HasSuffix(headline, "…**") {
+				t.Errorf("headline = %q, want bold truncated content", headline)
+			}
+		})
+	}
+}
+
+func TestPayloadSeverityBudgets(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		headline string
+		omit     bool
+	}{
+		{"long severity", "h", false},
+		{"remaining budget", strings.Repeat("h", 3400), false},
+		{"wrappers cannot fit", strings.Repeat("h", 3470), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := Decision{Links: []LinkResult{{ID: ghsa, Fires: true, Severity: strings.Repeat("é!", 1000)}}}
+			p := BuildPayload(&store.Release{}, &summarize.Summary{Headline: tc.headline}, d)
+			if len(p.Body) > BodyBudget || !utf8.ValidString(p.Body) {
+				t.Errorf("body bytes %d, valid UTF-8 %v", len(p.Body), utf8.ValidString(p.Body))
+			}
+			parts := strings.Split(p.Body, "\n\n")
+			if tc.omit {
+				if len(parts) != 1 {
+					t.Errorf("body = %q, want only headline when severity wrappers cannot fit", p.Body)
+				}
+				return
+			}
+			if len(parts) != 2 || !strings.HasPrefix(parts[1], "Severity: **") ||
+				!strings.HasSuffix(parts[1], "…** ("+escapeMarkdown(ghsa)+")") {
+				t.Errorf("body = %q, want closed bold severity with truncated content", p.Body)
+			}
+		})
+	}
+}
+
 func TestTruncateMarkdown(t *testing.T) {
 	for _, tc := range []struct {
 		name string

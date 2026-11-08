@@ -78,12 +78,22 @@ func BuildPayload(r *store.Release, sum *summarize.Summary, d Decision) Payload 
 	var parts []string
 	switch {
 	case sum != nil:
-		parts = append(parts, "**"+escapeMarkdown(sum.Headline)+"**")
+		parts = append(parts, "**"+truncate(escapeMarkdown(sum.Headline), BodyBudget-4)+"**")
 	case len(firing) > 0 && len(firing[0].Matching) > 0:
-		parts = append(parts, "**"+escapeMarkdown(firing[0].Matching[0].Summary)+"**")
+		parts = append(parts, "**"+truncate(escapeMarkdown(firing[0].Matching[0].Summary), BodyBudget-4)+"**")
 	}
 	for _, l := range firing {
-		parts = append(parts, "Severity: **"+escapeMarkdown(l.Severity)+"** ("+escapeMarkdown(l.ID)+")")
+		prefix, suffix := "Severity: **", "** ("+escapeMarkdown(l.ID)+")"
+		left := BodyBudget - len(strings.Join(parts, "\n\n"))
+		if len(parts) > 0 {
+			left -= len("\n\n")
+		}
+		contentBudget := left - len(prefix) - len(suffix)
+		if contentBudget < len("…") {
+			p.Body = assemble(parts, BodyBudget)
+			return p
+		}
+		parts = append(parts, prefix+truncate(escapeMarkdown(l.Severity), contentBudget)+suffix)
 	}
 	if sum != nil {
 		if reason := sum.SecurityReason; reason != "" {
